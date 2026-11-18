@@ -1,17 +1,20 @@
 {
   "name": "wyze-api",
-  "version": "2.0.0-beta.2",
+  "version": "2.0.0-beta.4",
   "description": "An unofficial API wrapper for Wyze products.",
-  "homepage": "https://github.com/jfarmer08/wyze-api",
+  "homepage": "https://github.com/identd113/wyze-api",
   "main": "./src/index.js",
   "bin": {
     "wyze-api-fetch-wyze-sdk": "scripts/fetch-wyze-sdk.js"
   },
   "scripts": {
     "test": "node --test --test-reporter=spec tests/*.test.js",
+    "lint": "eslint src scripts tests --max-warnings=0",
+    "test:future": "node --test future/*/test/*.test.js",
     "fetch-wyze-sdk": "node scripts/fetch-wyze-sdk.js",
-    "tutk-smoke": "tests/docker/run-tutk-smoke.sh",
-    "tutk-smoke-real": "tests/docker/run-real-camera-smoke.sh"
+    "camera-test": "node scripts/camera-test-web.js",
+    "tutk-smoke": "future/tutk/docker/run-tutk-smoke.sh",
+    "tutk-smoke-real": "future/tutk/docker/run-real-camera-smoke.sh"
   },
   "keywords": [
     "wyze",
@@ -29,35 +32,32 @@
   "dependencies": {
     "axios": "^1.12.0",
     "ffmpeg-static": "^5.3.0",
-    "koffi": "^3.0.2",
-    "querystring": "0.2.1",
     "utf8": "3.0.0",
     "uuid-by-string": "4.0.0",
-    "werift": "^0.20.1",
+    "werift": "^0.25.1",
     "ws": "^8.20.0"
   },
-  "funding": [
-    {
-      "type": "paypal",
-      "url": "https://paypal.me/AllenFarmer"
-    },
-    {
-      "type": "venmo",
-      "url": "https://venmo.com/u/Allen-Farmer"
-    },
-    {
-      "type": "cashApp",
-      "url": "https://cash.app/$Jfamer08"
-    }
-  ],
   "directories": {
     "example": "example"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jfarmer08/wyze-api.git"
+    "url": "git+https://github.com/identd113/wyze-api.git"
   },
   "bugs": {
-    "url": "https://github.com/jfarmer08/wyze-api/issues"
+    "url": "https://github.com/identd113/homebridge-wyze-smart-home/issues/new?template=bug-report.yml&origin=wyze-api"
+  },
+  "files": [
+    "src",
+    "scripts/*.js",
+    "scripts/README.md",
+    "docs",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.1"
   }
 }

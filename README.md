@@ -2,15 +2,18 @@
 [![npm](https://img.shields.io/npm/dt/wyze-api)](https://www.npmjs.com/package/wyze-api)
 [![npm](https://img.shields.io/npm/v/wyze-api.svg?style=flat-square)](https://www.npmjs.com/package/wyze-api)
 [![Chat](https://img.shields.io/discord/1134601590762913863)](https://discord.gg/Mjkpq2x9)
-[![GitHub last commit](https://img.shields.io/github/last-commit/jfarmer08/wyze-api)](https://github.com/jfarmer08/wyze-api)
+[![GitHub last commit](https://img.shields.io/github/last-commit/identd113/wyze-api)](https://github.com/identd113/wyze-api)
+[![CI](https://github.com/identd113/wyze-api/actions/workflows/ci.yml/badge.svg?branch=2.x)](https://github.com/identd113/wyze-api/actions/workflows/ci.yml)
 
-
-# Funding   [![Donate](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=flat-square&maxAge=2592000)](https://www.paypal.com/paypalme/AllenFarmer) [![Donate](https://img.shields.io/badge/Donate-Venmo-blue.svg?style=flat-square&maxAge=2592000)](https://venmo.com/u/Allen-Farmer) [![Donate](https://img.shields.io/badge/Donate-Cash_App-blue.svg?style=flat-square&maxAge=2592000)](https://cash.app/$Jfamer08)
 
 This is an unofficial Wyze API. This library uses the internal APIs from the Wyze mobile app. A list of all Wyze devices can be retrieved to check the status of Cameras, Senors, Bulbs, Plugs, Locks and more. This API can turn on and off cameras, lightbulbs and plugs and more.
 
+**Problems and new devices:** this library's issues are tracked in the [homebridge-wyze-smart-home](https://github.com/identd113/homebridge-wyze-smart-home/issues/new/choose) repository. [Report a library bug](https://github.com/identd113/homebridge-wyze-smart-home/issues/new?template=bug-report.yml&origin=wyze-api), [report or request a device](https://github.com/identd113/homebridge-wyze-smart-home/issues/new?template=new-device.yml&origin=wyze-api), and ask questions in its [discussions](https://github.com/identd113/homebridge-wyze-smart-home/discussions).
+
 ## Setup
 `npm install wyze-api --save`
+
+Requires Node.js 22 or newer.
 
 ## Example
 ```
@@ -21,7 +24,8 @@ const options = {
   password: process.env.password,
   keyId: process.env.keyId,
   apiKey: process.env.apiKey,
-  persistPath: "./",
+  mfaCode: process.env.mfaCode, // optional, only required if your account has 2FA enabled
+  // persistPath: "/path/for/saved-tokens", // optional; defaults to ~/.wyze-api
   logLevel: "none"
 }
 const wyze = new Wyze(options)
@@ -48,6 +52,16 @@ const wyze = new Wyze(options)
 
 ## Run
 `username=first.last@email.om password=123456 keyId=2222222 apiKey=222222 node index.js`
+
+## 2FA / MFA accounts
+The API key (`keyId` and `apiKey`) is what `login()` needs, and it is enough for most accounts, including an account with an
+authenticator app turned on. If Wyze does answer the login with a 2-factor challenge, pass the current 6-digit code from your
+authenticator app as `mfaCode` (authenticator apps only; SMS and email codes are not supported). The code works once and expires
+after 30 seconds, so it must be current when `login()` runs; the login then saves its tokens and later runs refresh them without
+a code. If a code is needed and `mfaCode` is missing, `login()` throws an error saying so.
+
+**`totpSecret` is deprecated and ignored.** It used to generate a fresh code from the authenticator secret at every login. A value
+is still accepted so an existing config does not break, and the client logs a warning that it is not used. You can remove it.
 
 ## Helper methods
 
@@ -89,6 +103,9 @@ Use these helper methods to interact with wyze-api.
 - wyze.cameraMotionRecording(device.mac, device.product_model, value)
 - wyze.cameraMotionRecordingOn(device.mac, device.product_model)
 - wyze.cameraMotionRecordingOff(device.mac, device.product_model)
+- wyze.cameraGetDeviceMgmtState(device.mac, device.product_model) — state for cameras on the devicemgmt API (Floodlight Pro, Battery Cam Pro, OG, Pan v4) in one call: `{on, available, siren, floodlight, notify, motion}`
+- wyze.cameraGetEvents(device.mac, [{sinceMs=300000, count=20}]) — recent cloud events for a camera, newest first: `{id, time, value, type, tags, params}` where `type` is `MOTION`, `SOUND`, `DOORBELL_RANG` and so on (`EventAlarmType`, with `AiEventTag` for person/vehicle/package). Read-only. Events change after they appear (a doorbell press starts as `MOTION` and is flipped to `DOORBELL_RANG` within seconds), so compare by `id` on every poll. The list depends on the Wyze plan: a camera without one records about one motion event per 5 minutes.
+- wyze.cameraUsesDeviceMgmt(model) / cameraIsDoorbell(model) / cameraSupportsPowerControl(model) — sync checks by model. The Doorbell v2 (`HL_DB2`) is a doorbell and can't be powered off through the API, so `cameraSupportsPowerControl("HL_DB2")` is false.
 
 ### Camera Stream Methods (WebRTC)
 
@@ -97,6 +114,8 @@ These return the credentials a WebRTC client (werift, go2rtc, Kinesis Video Stre
 **Primary**:
 - wyze.getCameraWebRTCConnectionInfo(mac, model, [options]) — bundled, ready-to-use shape: `{signalingUrl, iceServers, authToken, clientId, mac, model, substream, cached}`. `iceServers` are normalized to the `{urls, ...}` shape `RTCPeerConnection` expects; `signalingUrl` has any double-encoding decoded and (by default) the generated `clientId` injected as `X-Amz-ClientId`. Cached for 60s per `(mac, substream)`. Options: `substream`, `includeClientId`, `clientId`, `clientIdPrefix`, `noCache`, `cacheTtlMs`.
 - wyze.getCameraWebRTCConnectionInfoWithReconnect(mac, model, [options], [retryOptions]) — same, with exponential-backoff retry. `retryOptions`: `{maxAttempts=3, baseDelayMs=2000, onRetry}`.
+
+**Sessions**: a Wyze camera serves one WebRTC viewer at a time. `captureStreamFrame`, `cameraStartRtpForwarding` and `startCameraHKStream` keep at most one session per camera: a new one waits for the previous to finish closing, a live stream replaces a snapshot capture in flight, and a snapshot is refused while a stream is open. `startCameraHKStream` returns `{stop(), isAlive()}`. Call `wyze.closeAllCameraSessions()` when your process shuts down so cameras aren't left with a dead viewer.
 
 **Lower-level**:
 - wyze.cameraGetStreamInfo(mac, model, [options]) — raw API shape `{signaling_url, ice_servers, auth_token, ...}`. `options.substream` requests the lower-bitrate sub stream.
@@ -215,7 +234,8 @@ Lookups (async):
 - wyze.setIotProp(device.mac, device.product_model, propKey, value)
 - wyze.getUserProfile()
 - wyze.disableRemeAlarm(hms_id)
-- wyze.getPlanBindingListByUser()
+- wyze.getPlanBindingListByUser(groupId = "hms")
+- wyze.getCamPlusPlans()
 - wyze.monitoringProfileStateStatus(hms_id)
 - wyze.monitoringProfileActive(hms_id, home, away)
 - wyze.iot3GetProperties(deviceMac, deviceModel, props)
@@ -228,13 +248,15 @@ protocols so cameras can be controlled without going through Wyze's
 cloud HTTP API. This work is in-progress; the table below tracks
 where each protocol stands.
 
-### Tutk (V2 / V3 / V4 / Pan / Outdoor / OG / Doorbell v1 / Vacuum)
+### Tutk (V2 / V3 / V4 / Pan / Outdoor / OG / Doorbell v1 / Vacuum) — parked in [`future/tutk/`](future/tutk/)
+
+Not part of the published package and not used by the library or the plugin. Kept for later; see its README.
 
 | Phase | What | Status |
 |---|---|---|
-| **0**  | Pure-JS protocol layer (`src/tutk/lib/` — codec, header, K-class messages, xxtea, auth) — byte-exact against docker-wyze-bridge Python reference | ✅ done |
-| **1**  | `koffi` loader for `libIOTCAPIs_ALL.so` (`src/tutk/loader.js`) + Promise-based session/auth/IOCtrl mux (`src/tutk/session.js`), with koffi `.async()` for non-blocking blocking calls | ✅ done |
-| **1.5**| Self-test harness without the `.so` (stub SDK) + Docker smoke that loads the real `.so` (`tests/docker/`) + real-camera smoke (`tests/docker/connect-real-camera.js`) | ✅ done |
+| **0**  | Pure-JS protocol layer (`future/tutk/lib/` — codec, header, K-class messages, xxtea, auth) — byte-exact against docker-wyze-bridge Python reference | ✅ done |
+| **1**  | `koffi` loader for `libIOTCAPIs_ALL.so` (`future/tutk/loader.js`) + Promise-based session/auth/IOCtrl mux (`future/tutk/session.js`), with koffi `.async()` for non-blocking blocking calls | ✅ done |
+| **1.5**| Self-test harness without the `.so` (stub SDK) + Docker smoke that loads the real `.so` (`future/tutk/docker/`) + real-camera smoke (`future/tutk/docker/connect-real-camera.js`) | ✅ done |
 | **2**  | Worker-thread receive pump (move 50 Hz `avRecvIOCtrl` poll off the main loop so video streaming is viable) | ⏳ planned |
 | **2.5**| Wire Tutk control into the homebridge bridge: route camera commands locally when Tutk is up, fall back to cloud HTTP otherwise | ⏳ planned |
 | **3**  | A/V transport — `avRecvFrameData2` → H.264 NALUs into a stream HomeKit can consume | ⏳ planned |
@@ -243,11 +265,13 @@ Tutk runs on Linux only (the SDK ships glibc binaries for x86_64,
 arm64, armv7). macOS/Windows hosts can still talk to cameras through
 the cloud HTTP API as today.
 
-### GUTES (Doorbell Pro family / Gwell devices)
+### GUTES (Doorbell Pro family / Gwell devices) — parked in [`future/gutes/`](future/gutes/)
+
+Not part of the published package and not used by the library. Kept for later; see its README.
 
 | Phase | What | Status |
 |---|---|---|
-| **0** | Pure-JS protocol layer (`src/gutes/lib/` — RC5, frame parser, session crypto, KEEPALIVE builders, pcap reader) — byte-exact against cryze Python reference | ✅ done |
+| **0** | Pure-JS protocol layer (`future/gutes/lib/` — RC5, frame parser, session crypto, KEEPALIVE builders, pcap reader) — byte-exact against cryze Python reference | ✅ done |
 | **1** | `libiotp2pav.so` loading via `koffi` — blocked on writing a Bionic-to-glibc shim (the GUTES `.so` is extracted from the Wyze APK and depends on Android's libc) | ❌ not started |
 | **2** | A/V transport (MTP_DATA reassembly into H.264 NALUs) — blocked on Phase 1 | ❌ not started |
 
@@ -258,13 +282,30 @@ see [`scripts/README.md`](scripts/README.md) and run
 
 ### Deep-dive READMEs
 
-- [`src/tutk/README.md`](src/tutk/README.md) — loader + session details, lifecycle, thread model
-- [`src/gutes/README.md`](src/gutes/README.md) — protocol layer + Phase 1 wall (Bionic shim)
-- [`example/tutk-spike/README.md`](example/tutk-spike/README.md) — Tutk Phase 0 demo + fixtures
-- [`example/gutes-spike/README.md`](example/gutes-spike/README.md) — GUTES Phase 0 demo + pcap reader
-- [`tests/docker/README.md`](tests/docker/README.md) — Docker smoke harness + Docker Desktop on Mac UDP NAT caveats
+- [`future/tutk/README.md`](future/tutk/README.md) — loader + session details, lifecycle, thread model
+- [`future/gutes/README.md`](future/gutes/README.md) — where it stands, protocol layer + Phase 1 wall (Bionic shim)
+- [`future/tutk/demo/README.md`](future/tutk/demo/README.md) — Tutk Phase 0 demo + fixtures
+- [`future/gutes/demo/README.md`](future/gutes/demo/README.md) — GUTES Phase 0 demo + pcap reader
+- [`future/tutk/docker/README.md`](future/tutk/docker/README.md) — Docker smoke harness + Docker Desktop on Mac UDP NAT caveats
+
+## Development
+
+```
+git clone https://github.com/identd113/wyze-api.git
+cd wyze-api
+npm install
+npm test
+npm run lint
+```
+
+- **Tests** are in [`tests/`](tests/) and run with `npm test` (Node 22 or newer). They need no network and no Wyze account. That includes [`tests/compat-1x.test.js`](tests/compat-1x.test.js), which fails if 2.x drops or reorders anything that 1.1.15 offered. CI runs them, and `npm run lint` (ESLint on `src`, `scripts` and `tests`, no warnings allowed), on every pull request.
+- **Parked experiments** (the TUTK and GUTES local-camera protocols) are in [`future/`](future/README.md) and are not published. Their tests run with `npm run test:future`.
+- **Probe scripts** that check endpoints against a real account are in [`scripts/`](scripts/README.md). They read your credentials from a `.env` file (see `.env.sample`) and save the login token to `~/.wyze-api`.
+- **Documentation** for contributors is indexed in [`docs/`](docs/README.md): the endpoint notes, camera properties, design notes, and who depends on the library.
 
 ## Other Info
+
+Who depends on this library, and what we promise them (including that 2.x is a drop-in for 1.x): [Downstream](docs/downstream.md).
 
 Special thanks to the following projects for reference and inspiration:
 

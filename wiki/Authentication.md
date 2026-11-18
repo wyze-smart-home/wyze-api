@@ -1,6 +1,6 @@
 # Authentication
 
-Wyze requires four pieces of credentials to log in: account `username` + `password`, plus a developer `keyId` + `apiKey`. Get the latter two from <https://developer-api-console.wyze.com/>. MFA accounts also need a `mfaCode`.
+Wyze requires four pieces of credentials to log in: account `username` + `password`, plus a developer `keyId` + `apiKey`. Get the latter two from <https://developer-api-console.wyze.com/>. MFA accounts also need a `totpSecret` (recommended) or a `mfaCode`.
 
 You don't normally call `login()` directly — every public method calls `maybeLogin()` first.
 
@@ -12,11 +12,11 @@ const wyze = new Wyze({
   password: process.env.PASSWORD,
   keyId: process.env.KEY_ID,
   apiKey: process.env.API_KEY,
-  persistPath: "./",
+  // persistPath: "/path/for/saved-tokens", // optional; defaults to ~/.wyze-api
 });
 ```
 
-With `persistPath` set, tokens are written to `<persistPath>/wyze-<uuid-from-username>.json` and loaded on subsequent `maybeLogin()` calls. **Without it, every process restart triggers a fresh login** — Wyze rate-limits aggressive logins and may temporarily lock the account.
+Tokens are written to `<persistPath>/wyze-<uuid-from-username>.json` (`persistPath` defaults to `$WYZE_API_PERSIST_PATH`, else `~/.wyze-api`) and loaded on subsequent `maybeLogin()` calls. **Without it, every process restart triggers a fresh login** — Wyze rate-limits aggressive logins and may temporarily lock the account.
 
 ## Login flow
 
@@ -42,6 +42,27 @@ Attempting to login before debounce has cleared, waiting N seconds
 
 ## MFA
 
+Only authenticator-app (TOTP) 2FA is supported; SMS and email codes are not.
+
+### `totpSecret` (recommended)
+
+Pass the base32 key Wyze shows next to the QR code when you set up the authenticator app, and the library generates a fresh 6-digit code on every login (a typed `mfaCode` expires after 30 seconds):
+
+```js
+const wyze = new Wyze({
+  username: process.env.USERNAME,
+  password: process.env.PASSWORD,
+  keyId: process.env.KEY_ID,
+  apiKey: process.env.API_KEY,
+  totpSecret: process.env.TOTP_SECRET,
+  // persistPath: "/path/for/saved-tokens", // optional; defaults to ~/.wyze-api
+});
+```
+
+Spaces, dashes, quotes and a pasted `otpauth://...?secret=` link are cleaned up automatically; a malformed secret gives a clear login error. If a code is about to expire or was already used, the library waits for the next window and retries once. If both are set, `totpSecret` wins.
+
+### `mfaCode`
+
 Pass the current TOTP code as `mfaCode` in the constructor:
 
 ```js
@@ -51,7 +72,7 @@ const wyze = new Wyze({
   keyId: process.env.KEY_ID,
   apiKey: process.env.API_KEY,
   mfaCode: "123456",
-  persistPath: "./",
+  // persistPath: "/path/for/saved-tokens", // optional; defaults to ~/.wyze-api
 });
 ```
 

@@ -2,6 +2,24 @@ const axios = require("axios");
 const crypto = require("../utils/crypto");
 const constants = require("../constants");
 const cameraStreamCapture = require("./cameraStreamCapture");
+const { EventAlarmType, AiEventTag } = require("../types");
+
+// A get-streams answer carries the signed signaling URL, an auth token and the TURN credentials in `params`; those must
+// not reach a log or an error message, so they are replaced before one is built from the answer.
+function withoutStreamSecrets(answer) {
+  try {
+    const copy = JSON.parse(JSON.stringify(answer ?? null));
+    for (const item of Array.isArray(copy?.data) ? copy.data : []) {
+      if (item && typeof item === "object" && "params" in item) item.params = "[hidden]";
+    }
+    return copy;
+  } catch (_) {
+    return "[unreadable]";
+  }
+}
+
+// `sv` the Wyze app sends with app/v2/device/get_event_list (from wyze-sdk).
+const SV_GET_EVENT_LIST = "bdcb412e230049c0be0916e75022d3f3";
 
 /**
  * Wyze Cameras — controls (power, siren, lights, motion, notifications,
@@ -93,7 +111,7 @@ module.exports = {
       await this._checkRateLimit(response.headers);
 
       const data = response.data;
-              this.log.debug(`API response cameraGetStreamInfo: ${JSON.stringify(data)}`);
+              this.log.debug(`API response cameraGetStreamInfo: ${JSON.stringify(withoutStreamSecrets(data))}`);
 
       const code = data?.code;
       const errorMessage = data?.msg || data?.description || "";
@@ -109,27 +127,31 @@ module.exports = {
           throw new Error(`Wyze API rate limited (${code}): ${errorMessage}`);
         }
         if (String(code) === constants.deviceOfflineCode) {
-          throw new Error(`Camera is offline: ${JSON.stringify(data)}`);
+          throw new Error(`Camera is offline: ${JSON.stringify(withoutStreamSecrets(data))}`);
         }
         throw new Error(`Wyze API Error (${code}) - ${errorMessage}`);
       }
 
       if (!Array.isArray(data.data) || data.data.length !== 1) {
-        throw new Error(`Unexpected response from cameraGetStreamInfo: ${JSON.stringify(data)}`);
+        throw new Error(`Unexpected response from cameraGetStreamInfo: ${JSON.stringify(withoutStreamSecrets(data))}`);
       }
 
       const entry = data.data[0];
       if (!entry.property) {
-        throw new Error(`Unexpected response from cameraGetStreamInfo: ${JSON.stringify(entry)}`);
+        throw new Error(`Unexpected response from cameraGetStreamInfo: ${JSON.stringify(withoutStreamSecrets({ data: [entry] }))}`);
       }
       // Cameras in WebRTC-only mode report iot-state=0 but still return a valid
       // signaling URL. Only block if there's genuinely no way to reach the camera.
       const hasSignalingUrl = typeof entry.params?.signaling_url === "string" && entry.params.signaling_url.length > 0;
+      // Only the capability map goes in the messages: the rest of the entry holds
+      // the signed signaling URL and auth token, which must not reach logs.
       if (entry.property["iot-device::iot-state"] !== 1 && !hasSignalingUrl) {
-        throw new Error(`Camera is offline: ${JSON.stringify(entry)}`);
+        throw new Error(`Camera is offline: ${JSON.stringify(entry.property)}`);
       }
-      if (entry.property["iot-device::iot-power"] !== 1) {
-        throw new Error(`Camera is off: ${JSON.stringify(entry)}`);
+      // Some models (Doorbell v2) don't report iot-power at all; only an explicit
+      // 0 means the camera is off.
+      if (entry.property["iot-device::iot-power"] === 0) {
+        throw new Error(`Camera is off: ${JSON.stringify(entry.property)}`);
       }
       return entry.params;
     } catch (error) {
@@ -139,6 +161,84 @@ module.exports = {
       }
       throw error;
     }
+  },
+
+  // ---- Cloud events (motion, sound, doorbell rang) --------------------------
+
+  /**
+   * Recent events for a camera from the cloud event list, newest first:
+   * `{ id, time, ageMs, value, type, tags, params }`. `type` is the EventAlarmType name
+   * ("MOTION", "DOORBELL_RANG", ...). `ageMs` is how old the event is by Wyze's own clock (the
+   * time Wyze put on the reply, minus the event's time), so it is right even when this host's
+   * clock is off. Events change after they appear (a doorbell press starts as MOTION and is
+   * flipped to DOORBELL_RANG, AI tags arrive a few seconds late), so compare by `id` on every
+   * call. Read-only.
+   * @param {string} deviceMac
+   * @param {{ sinceMs?: number, count?: number, types?: string[], tags?: string[] }} [options] look-back window
+   *   (default 5 min), max events (1-20), event types to ask for by EventAlarmType name (default: every type),
+   *   and AI tags by AiEventTag name ("PERSON", "PACKAGE", ...) to ask only for events that carry one
+   */
+  async cameraGetEvents(deviceMac, { sinceMs = 5 * 60_000, count = 20, types = [], tags = [] } = {}) {
+    const byMac = await this.cameraGetEventsMulti([deviceMac], { sinceMs, count, types, tags });
+    return byMac[deviceMac] ?? [];
+  },
+
+  /**
+   * Recent events for several cameras in ONE request (the cloud call takes a list of
+   * cameras), grouped by camera: `{ [mac]: events[] }`, each list newest first. Every
+   * camera in `deviceMacs` is present, with an empty list when it has no events.
+   * `count` (1-20) is the most events returned in total, across all the cameras, newest
+   * first, so one busy camera can crowd out the others' older events but never their
+   * newest ones. Read-only.
+   * @param {string[]} deviceMacs
+   * @param {{ sinceMs?: number, count?: number, types?: string[], tags?: string[] }} [options] `types` are
+   *   EventAlarmType names ("SOUND", ...); with none, every event type comes back. `tags` are AiEventTag
+   *   names ("PERSON", "PACKAGE", ...): only events carrying one of them come back
+   */
+  async cameraGetEventsMulti(deviceMacs, { sinceMs = 5 * 60_000, count = 20, types = [], tags = [] } = {}) {
+    // An unknown name used to be dropped quietly, and an empty list means "no filter": a typo returned every event.
+    const unknownTypes = types.filter((name) => !Object.hasOwn(EventAlarmType, name));
+    const unknownTags = tags.filter((name) => !Object.hasOwn(AiEventTag, name));
+    if (unknownTypes.length || unknownTags.length) {
+      const bad = [...unknownTypes.map((name) => `type "${name}"`), ...unknownTags.map((name) => `tag "${name}"`)];
+      throw new Error(`cameraGetEvents: unknown event ${bad.join(", ")}. Types: ${Object.keys(EventAlarmType).join(", ")}. Tags: ${Object.keys(AiEventTag).join(", ")}.`);
+    }
+    const macs = [...new Set(deviceMacs)];
+    const grouped = Object.fromEntries(macs.map((mac) => [mac, []]));
+    if (macs.length === 0) return grouped;
+    const now = Date.now();
+    const result = await this.request("app/v2/device/get_event_list", {
+      device_mac_list: macs,
+      event_value_list: types.flatMap((name) => EventAlarmType[name] ?? []),
+      event_tag_list: tags.map((name) => AiEventTag[name]).filter((value) => value !== undefined),
+      event_type: "1",
+      order_by: 2,
+      count: Math.min(Math.max(count, 1), 20),
+      begin_time: now - sinceMs,
+      end_time: now + 60_000,
+      sv: SV_GET_EVENT_LIST,
+    });
+    const events = result?.data?.data?.event_list ?? [];
+    // Wyze's clock when it answered; the event times are on the same clock.
+    const wyzeNow = Number(result?.data?.ts);
+    const reference = Number.isFinite(wyzeNow) && wyzeNow > 0 ? wyzeNow : now;
+    for (const e of events) {
+      // A single-camera request may omit the camera on each event; it can only be that camera.
+      const mac = e.device_mac ?? (macs.length === 1 ? macs[0] : null);
+      if (!mac || !grouped[mac]) continue;
+      const value = Number(e.event_value);
+      const type = Object.keys(EventAlarmType).find((name) => EventAlarmType[name].includes(value)) ?? null;
+      grouped[mac].push({
+        id: e.event_id,
+        time: Number(e.event_ts),
+        ageMs: reference - Number(e.event_ts),
+        value,
+        type,
+        tags: Array.isArray(e.tag_list) ? e.tag_list : [],
+        params: e.event_params ?? {},
+      });
+    }
+    return grouped;
   },
 
   // ---- Snapshot capture (headless WebRTC) ---------------------------------
@@ -156,17 +256,30 @@ module.exports = {
       if (entry && entry.expiresAt > Date.now()) return entry.buffer;
     }
 
-    const conn = await this.getCameraWebRTCConnectionInfo(deviceMac, deviceModel, {
-      noCache: true,
-      includeClientId: false,
-    });
-
-    const buffer = await cameraStreamCapture.captureStreamFrame({
-      signalingUrl: conn.signalingUrl,
-      iceServers: conn.iceServers,
-      logger: this.apiLogEnabled ? this.log : null,
-      timeoutMs,
-    });
+    const logger = cameraStreamCapture.labelLogger(this.apiLogEnabled ? this.log : null, options.label || deviceMac);
+    let buffer;
+    for (let attempt = 1; ; attempt += 1) {
+      const conn = await this.getCameraWebRTCConnectionInfo(deviceMac, deviceModel, {
+        noCache: true,
+        includeClientId: false,
+      });
+      try {
+        buffer = await cameraStreamCapture.captureStreamFrame({
+          signalingUrl: conn.signalingUrl,
+          iceServers: conn.iceServers,
+          logger,
+          timeoutMs,
+          sessionKey: deviceMac, // one WebRTC session per camera
+        });
+        break;
+      } catch (err) {
+        // ffmpeg occasionally loses a race for its local UDP port (another process takes
+        // it between choosing it and opening it). Nothing is wrong with the camera: go
+        // again once, with fresh connection details.
+        if (attempt >= 2 || !/address already in use/i.test(err.message)) throw err;
+        logger?.debug?.("[capture] ffmpeg could not use its local port; trying once more");
+      }
+    }
 
     if (!noCache) {
       this._snapshotCaptureCache.set(deviceMac, {
@@ -178,14 +291,15 @@ module.exports = {
   },
 
   /**
-   * Cloud thumbnail first, fall back to live capture.
+   * Cloud thumbnail first, fall back to live capture. Pass `options.deviceModel` to skip
+   * the device-list lookup that finds the camera's model.
    */
   async getCameraSnapshotImage(mac, options = {}) {
     if (!options.skipCloud) {
       const cloud = await this.getCameraSnapshot(mac);
       if (cloud?.url) {
         try {
-          const resp = await axios.get(cloud.url, { responseType: "arraybuffer" });
+          const resp = await axios.get(cloud.url, { responseType: "arraybuffer", timeout: 15_000, maxContentLength: 20 * 1024 * 1024 }); // a thumbnail host is not a Wyze host: bound the wait and the size
           return { buffer: Buffer.from(resp.data), source: "cloud" };
         } catch (err) {
           this.log.warning(`Cloud snapshot fetch failed, falling back to capture: ${err.message}`);
@@ -193,9 +307,15 @@ module.exports = {
       }
     }
 
-    const camera = await this.getCamera(mac);
-    if (!camera) throw new Error(`Camera not found: ${mac}`);
-    const buffer = await this.cameraCaptureSnapshot(camera.mac, camera.product_model, options);
+    // A caller that already knows the model (the plugin does) saves a whole device-list
+    // request per capture; otherwise look the camera up.
+    let model = options.deviceModel;
+    if (!model) {
+      const camera = await this.getCamera(mac);
+      if (!camera) throw new Error(`Camera not found: ${mac}`);
+      model = camera.product_model;
+    }
+    const buffer = await this.cameraCaptureSnapshot(mac, model, options);
     return { buffer, source: "capture" };
   },
 
@@ -272,6 +392,8 @@ module.exports = {
    */
   async cameraStreamWithReconnect(fn, { maxAttempts = 3, baseDelayMs = 2000, onRetry } = {}) {
     let attempt = 0;
+    // The loop ends by returning on success or throwing once the attempts are used up.
+    // eslint-disable-next-line no-constant-condition
     while (true) {
       try {
         return await fn();

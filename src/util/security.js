@@ -39,7 +39,7 @@ const WYZE_ALLOWED_HOSTNAMES = new Set(
 // Constructor option keys for the WyzeAPI client — used by the secrets
 // loader to know which fields to merge from secretsFile / env vars.
 const CREDENTIAL_KEYS = [
-  "username", "password", "mfaCode", "keyId", "apiKey",
+  "username", "password", "mfaCode", "totpSecret", "keyId", "apiKey",
   "authApiKey", "phoneId", "appName", "appVer", "appVersion",
   "userAgent", "sc", "sv",
   "fordAppKey", "fordAppSecret",
@@ -50,6 +50,7 @@ const ENV_MAP = {
   username: "WYZE_USERNAME",
   password: "WYZE_PASSWORD",
   mfaCode: "WYZE_MFA_CODE",
+  totpSecret: "WYZE_TOTP_SECRET",
   keyId: "WYZE_KEY_ID",
   apiKey: "WYZE_API_KEY",
   authApiKey: "WYZE_AUTH_API_KEY",
@@ -71,12 +72,15 @@ const ENV_MAP = {
 // CREDENTIAL_KEYS above — these are the field names that show up in
 // JSON dumps of API responses (`"access_token":"..."`, etc.).
 const REDACT_KEYS = [
-  "password", "apiKey", "keyId",
+  "password", "apiKey", "keyId", "mfaCode", "totpSecret", "verification_code",
   "access_token", "refresh_token", "accessToken", "refreshToken",
   "authorization",
   "fordAppSecret", "fordAppKey",
   "oliveSigningSecret", "oliveAppId",
   "authApiKey",
+  "auth_token", "signaling_url", "credential",
+  // The lock access-code encryption secret (Ford crypt_secret answer): it encrypts door PINs.
+  "secret", "crypt_secret",
 ];
 
 const MAX_LOG_LINE = 2000;
@@ -98,6 +102,7 @@ function sanitizeLogMessage(input) {
 
   // Strip newlines / tabs / control chars so a multi-line payload
   // can't break log parsing or smuggle escape sequences.
+  // eslint-disable-next-line no-control-regex -- removing control characters is the point
   s = s.replace(/[\r\n\t]+/g, " ").replace(/[\x00-\x1F\x7F]/g, "");
 
   // Bearer auth headers.
@@ -151,6 +156,7 @@ function sanitizeLogMessage(input) {
 function sanitizeDeviceName(name) {
   const clean = String(name || "")
     .replace(/[\r\n\t]+/g, " ")
+    // eslint-disable-next-line no-control-regex -- removing control characters is the point
     .replace(/[\x00-\x1F\x7F]/g, "")
     .trim();
   if (clean.length === 0) return "Wyze Device";
@@ -259,9 +265,13 @@ function getValidatedBaseUrls(config, log) {
 
 let _interceptorInstalled = false;
 
+// A request to Wyze that gets no answer must end, or whatever awaits it (login, every poll) hangs for good.
+// Applies only to requests bound for Wyze hosts and only when the caller set no timeout of their own.
+const WYZE_REQUEST_TIMEOUT_MS = 30_000;
+
 /**
  * Install a one-time axios interceptor that refuses to follow HTTP
- * redirects on requests bound for known Wyze hostnames. Wyze's real API
+ * redirects, and gives a request a 30 second timeout when it has none, on requests bound for known Wyze hostnames. Wyze's real API
  * never returns 3xx for these endpoints, so a redirect is at best a
  * configuration problem and at worst an attempt to steal the bearer
  * token by sending it to an attacker-controlled host.
@@ -283,6 +293,7 @@ function installRedirectGuard() {
     }
     if (hostname && WYZE_ALLOWED_HOSTNAMES.has(hostname)) {
       config.maxRedirects = 0;
+      if (!config.timeout) config.timeout = WYZE_REQUEST_TIMEOUT_MS;
     }
     return config;
   });
@@ -293,6 +304,7 @@ module.exports = {
   DEFAULT_AUTH_BASE_URL,
   DEFAULT_API_BASE_URL,
   WYZE_ALLOWED_HOSTNAMES,
+  WYZE_REQUEST_TIMEOUT_MS,
   CREDENTIAL_KEYS,
   REDACT_KEYS,
   ENV_MAP,

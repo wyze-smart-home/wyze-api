@@ -1,15 +1,17 @@
 //v0.2.0.0 Update on new releases
 
 const fs = require("fs").promises;
+const os = require("os");
 const path = require("path");
 const getUuid = require("uuid-by-string");
 const payloadFactory = require("./utils/payloadFactory");
-const crypto = require("./utils/crypto");
 const constants = require("./constants");
 const util = require("./util");
 const types = require("./types");
-const { installRedirectGuard, WYZE_ALLOWED_HOSTNAMES } = require("./util/security");
+const { installRedirectGuard, WYZE_ALLOWED_HOSTNAMES, sanitizeLogMessage } = require("./util/security");
+const { installRateLimitRetry, onRateLimit, waitFromHeaders, holdHost, MAX_WAIT_MS } = require("./util/rateLimit");
 const httpsAgent = require("./httpsAgent");
+const { normalizeMfaCode, isValidMfaCode } = require("./util/totp");
 const axios = require("axios");
 
 // Pin the DigiCert roots Wyze's backend depends on into axios's shared
@@ -25,9 +27,43 @@ axios.defaults.httpsAgent = httpsAgent;
 // another host. Other axios consumers in the same process aren't affected.
 installRedirectGuard();
 
+// A 429 from Wyze is waited out (Retry-After, or X-RateLimit-Reset) and the request sent again; see util/rateLimit.js.
+// The log lines go to the most recently built client's logger.
+// The host a request goes to, or null when the config does not make a URL.
+function safeHost(config) {
+  try {
+    return (config.baseURL ? new URL(config.url, config.baseURL) : new URL(config.url)).hostname;
+  } catch (_) {
+    return null;
+  }
+}
+
+let rateLimitLog = null;
+installRateLimitRetry(axios, (hostname) => WYZE_ALLOWED_HOSTNAMES.has(hostname));
+onRateLimit((info) => {
+  if (!rateLimitLog) return;
+  if (info.kind === "wait") {
+    rateLimitLog.warn(`Wyze rate limit (${info.status}) on ${info.host}${info.path}: waiting ${info.waitMs}ms${info.said ? "" : " (Wyze gave no time)"} before retry ${info.attempt}`);
+  } else {
+    rateLimitLog.error(`Wyze rate limit (${info.status}) on ${info.host}${info.path}: not retrying (asked to wait ${info.waitMs}ms)`);
+  }
+});
+
 const { propertyIds: PIDs } = types;
 
 const { WyzeLogger, LEVELS: LOG_LEVELS } = require("./util/wyzeLogger");
+
+// A failed login or refresh, in words. The reply is an axios response, which has circular references and cannot be
+// turned into JSON whole (doing so threw a TypeError that hid the real failure), so only its useful parts are used.
+function describeResult(result) {
+  let text;
+  try {
+    text = JSON.stringify({ ok: result?.ok, status: result?.status, data: result?.data, error: result?.error });
+  } catch (_) {
+    text = String(result?.error?.message || result?.status || "no details");
+  }
+  return sanitizeLogMessage(text);
+}
 
 module.exports = class WyzeAPI {
   // The optional second arg is ignored — kept only so existing callers
@@ -36,6 +72,14 @@ module.exports = class WyzeAPI {
   // line and color-codes the level tag, independently of whatever the
   // homebridge plugin layer does with its own log object.
   constructor(options /*, log [unused] */) {
+    if (typeof options.username !== "string" || !options.username) {
+      throw new Error(
+        "WyzeAPI requires a non-empty 'username' option (your Wyze account email) - " +
+        "this is needed even when logging in with apiKey/keyId, since it's used to " +
+        "namespace the persisted token cache file."
+      );
+    }
+
     // Resolve effective log level. apiLogEnabled is the legacy option —
     // honored for back-compat: true → debug, false/unset → info.
     const requestedLevel = options.logLevel
@@ -50,13 +94,30 @@ module.exports = class WyzeAPI {
       // debug captures. Off by default — never set true in shared logs.
       redact: options.disableLogRedaction !== true,
     });
-    this.persistPath = options.persistPath;
+    rateLimitLog = this.log;
+    // Where the login tokens are saved. Without an option, `WYZE_API_PERSIST_PATH`, else a per-user folder outside
+    // any project (`~/.wyze-api`). It used to have no default, and a client built without one failed at login.
+    this.persistPath = options.persistPath ?? process.env.WYZE_API_PERSIST_PATH ?? path.join(os.homedir(), ".wyze-api");
+    // The short-lived files for ffmpeg (SDP) go inside that folder too, not the OS temp folder, so a host such as
+    // Homebridge keeps everything the library writes inside its own storage.
+    require("./devices/cameraStreamCapture").setTempDirectory(path.join(this.persistPath, "tmp"));
     this.refreshTokenTimerEnabled = options.refreshTokenTimerEnabled || false;
     this.lowBatteryPercentage = options.lowBatteryPercentage || 30;
     // User login parameters
     this.username = options.username;
     this.password = options.password;
-    this.mfaCode = options.mfaCode;
+    // Tidy copy/paste damage (spaces, newlines, quotes, otpauth:// URIs) up front.
+    // Validation happens at login time so a bad value is a clear login error,
+    // not a constructor crash.
+    this.mfaCode = normalizeMfaCode(options.mfaCode) || undefined;
+    // Deprecated and ignored: it generated a 2FA code from the authenticator secret. A value is still accepted so an
+    // existing config does not break; the client says once that it is not used.
+    this.totpSecret = options.totpSecret || undefined;
+    if (this.totpSecret) {
+      this.log.warn(
+        'The "totpSecret" option is deprecated and no longer used. Wyze accounts log in with the API key (keyId and apiKey); you can remove it. A one-time "mfaCode" is still accepted.'
+      );
+    }
     this.apiKey = options.apiKey;
     this.keyId = options.keyId;
 
@@ -99,7 +160,20 @@ module.exports = class WyzeAPI {
 
     // Token is good for 216,000 seconds (60 hours) but 48 hours seems like a reasonable refresh interval 172800
     if (this.refreshTokenTimerEnabled === true) {
-      setInterval(this.refreshToken.bind(this), 172800);
+      this._refreshTokenInterval = setInterval(this.refreshToken.bind(this), 172800 * 1000);
+      // Don't keep a short-lived script (or a test) alive just for the refresh timer.
+      this._refreshTokenInterval.unref();
+    }
+  }
+
+  /**
+   * Stops the refresh-token timer started when refreshTokenTimerEnabled is true.
+   * Call this when done with the instance to let the process exit cleanly.
+   */
+  destroy() {
+    if (this._refreshTokenInterval) {
+      clearInterval(this._refreshTokenInterval);
+      this._refreshTokenInterval = null;
     }
   }
 
@@ -219,7 +293,7 @@ module.exports = class WyzeAPI {
     this._logApiResponse(result, url);
 
     // Check and handle API rate limiting
-    await this._checkRateLimit(result.headers);
+    await this._checkRateLimit(result.headers, config);
 
     // Handle API errors based on the response code
     return this._handleApiResponse(result, url, data);
@@ -269,28 +343,35 @@ module.exports = class WyzeAPI {
     );
   }
 
-  async _checkRateLimit(headers) {
+  async _checkRateLimit(headers, config) {
     try {
       const rateLimitRemaining = headers["x-ratelimit-remaining"]
         ? Number(headers["x-ratelimit-remaining"])
         : undefined;
 
-      const rateLimitResetBy = headers["x-ratelimit-reset-by"]
-        ? new Date(headers["x-ratelimit-reset-by"]).getTime()
-        : undefined;
+      // How long until the limit resets, from Retry-After or X-RateLimit-Reset(-By), or null when the headers say
+      // nothing usable (a missing or malformed value must not become NaN or an endless sleep).
+      const resetsIn = waitFromHeaders(headers);
 
       if (rateLimitRemaining !== undefined && rateLimitRemaining < 7) {
         // Critical — about to throttle. Always surface as warn.
-        const resetsIn = rateLimitResetBy - Date.now();
-        this.log.warn(
-          `API rate limit remaining: ${rateLimitRemaining} — sleeping until reset in ${resetsIn}ms`
-        );
-        await this.sleepMilliSecounds(resetsIn);
+        if (resetsIn === null) {
+          this.log.warn(`API rate limit remaining: ${rateLimitRemaining} — Wyze gave no reset time, not sleeping`);
+        } else {
+          const sleepMs = Math.min(resetsIn, MAX_WAIT_MS);
+          this.log.warn(
+            `API rate limit remaining: ${rateLimitRemaining} — sleeping until reset in ${sleepMs}ms`
+          );
+          // Other requests to this host wait too (the gate the 429 handler uses), instead of running into the limit.
+          const where = config && config.url ? safeHost(config) : null;
+          if (where) holdHost(where, sleepMs);
+          await this.sleepMilliSecounds(sleepMs);
+        }
       } else if (rateLimitRemaining !== undefined) {
-        // Normal remaining-count — info-level so users can see it without
-        // enabling debug. Filtered out at warn / error if log volume matters.
-        this.log.info(
-          `API rate limit remaining: ${rateLimitRemaining}. Expires in ${rateLimitResetBy - Date.now()}ms`
+        // Normal remaining-count: one line per request, so debug only. The
+        // critical case above is always a warning.
+        this.log.debug(
+          `API rate limit remaining: ${rateLimitRemaining}. Expires in ${resetsIn === null ? "an unknown time" : `${resetsIn}ms`}`
         );
       }
     } catch (err) {
@@ -317,14 +398,20 @@ module.exports = class WyzeAPI {
       }
 
       if (this._isAccessTokenError(code, errorMessage)) {
+        // The refresh call itself was refused: handling it as an expired access token would call refreshToken(),
+        // which returns the refresh that is already running, so it would wait on itself and never settle. Fail
+        // this refresh instead; _doRefreshToken then falls back to a fresh login.
+        if (url === "app/user/refresh_token") {
+          throw Object.assign(new Error(`Wyze refused the refresh token (${code}): ${errorMessage}`), { refreshRefused: true });
+        }
         return this._handleAccessTokenError(result, errorMessage, code, url, data);
       }
 
       if (this._isBadRequestError(code)) {
         throw new Error(
-          `Wyze API Bad Request: Check your request parameters - ${JSON.stringify(
+          `Wyze API Bad Request: Check your request parameters - ${sanitizeLogMessage(JSON.stringify(
             { code, message: errorMessage, url, requestBody: data }
-          )}`
+          ))}`
         );
       }
 
@@ -376,7 +463,18 @@ module.exports = class WyzeAPI {
 
   async _handleAccessTokenError(result, errorMessage, code, url, data) {
     this.access_token = "";
-    await this.refreshToken().catch((err) => {
+    await this.refreshToken().catch(async (err) => {
+      if (this._isTransientError(err)) {
+        // Network/server hiccup, not a verdict on the tokens: keep the
+        // persisted pair so the next call can retry the refresh. Wiping it
+        // here would force a full login (which a one-shot mfaCode can't do).
+        this.log.warn(`Token refresh failed transiently (${err.message}); keeping saved tokens.`);
+      } else {
+        // The refresh token is also dead - clear it and wipe the persisted
+        // file so the next maybeLogin() falls through to a real login instead
+        // of reloading this same broken pair from disk forever.
+        await this._clearPersistedTokens();
+      }
       throw new Error(
         `Refresh Token could not be used to get a new access token. ${err}`
       );
@@ -432,12 +530,17 @@ module.exports = class WyzeAPI {
         'KeyId Required, Please provide the "keyId" parameter in config.json'
       );
     } else {
-      const result = await this._performLoginRequest();
+      let result = await this._performLoginRequest();
+
+      // Wyze responds with no access_token and an mfa_details block when the
+      // account has 2FA enabled - complete the challenge with a follow-up request.
+      if (result.ok && !result.data.access_token && result.data.mfa_details) {
+        result = await this._performMfaLogin(result.data.mfa_details);
+      }
+
       if (!result.ok || !result.data.access_token) {
         throw new Error(
-          `Invalid credentials, please check username/password, keyId/apiKey - ${JSON.stringify(
-            result
-          )}`
+          `Invalid credentials, please check username/password, keyId/apiKey - ${describeResult(result)}`
         );
       }
       // Login is a noteworthy lifecycle event — surface at info so users
@@ -448,11 +551,58 @@ module.exports = class WyzeAPI {
   }
 
   /**
+   * Completes a TOTP authenticator-app MFA challenge returned by the login endpoint, with the one-time `mfaCode`.
+   * @param {object} mfaDetails - The `mfa_details` block from the login response.
+   * @returns {Promise<object>} - The result of the follow-up login request.
+   * @throws {Error} - Throws if no mfaCode was configured or the account uses an
+   *   unsupported MFA method (only TOTP authenticator apps are handled).
+   */
+  async _performMfaLogin(mfaDetails) {
+    const code = normalizeMfaCode(this.mfaCode);
+
+    if (!code) {
+      throw new Error(
+        'Wyze asked for a 2-factor code. Provide a current 6-digit "mfaCode" (an authenticator-app code, used once). The "totpSecret" option is deprecated and no longer used.'
+      );
+    }
+    if (!isValidMfaCode(code)) {
+      throw new Error(
+        `The "mfaCode" must be the 6-digit code from your authenticator app (got ${code.length} characters after removing spaces).`
+      );
+    }
+
+    const totpApp = mfaDetails.totp_apps?.[0];
+    if (!totpApp) {
+      throw new Error(
+        `Unsupported MFA method - only TOTP authenticator apps are currently supported. Received: ${sanitizeLogMessage(JSON.stringify(mfaDetails))}`
+      );
+    }
+
+    return this._performLoginRequest({
+      mfa_type: "TotpVerificationCode",
+      verification_id: totpApp.app_id,
+      verification_code: code,
+    });
+  }
+
+  /**
    * Ensures that the user is logged in by checking and managing the access token.
    * If the access token is missing or expired, it handles the login process,
    * considering debounce settings to avoid multiple login attempts.
    */
-  async maybeLogin() {
+  maybeLogin() {
+    // Several callers can find the token missing at once (parallel requests at start-up, or after a 2001).
+    // They share one attempt: a second login started while the first is running would race it, and a one-shot
+    // 2FA code fails on the repeat.
+    if (!this._maybeLoginPromise) {
+      this._maybeLoginPromise = this._maybeLogin().finally(() => {
+        this._maybeLoginPromise = null;
+      });
+    }
+    return this._maybeLoginPromise;
+  }
+
+  async _maybeLogin() {
     // Check if the access token is available.
     if (!this.access_token) {
       await this._loadPersistedTokens(); // Load any previously saved tokens.
@@ -477,7 +627,7 @@ module.exports = class WyzeAPI {
       // If the access token is still not available after waiting,
       // update debounce settings and try logging in again.
       if (!this.access_token) {
-        this.updateDebounceAndLogin(now);
+        await this.updateDebounceAndLogin(now);
       }
     }
   }
@@ -556,9 +706,21 @@ module.exports = class WyzeAPI {
   /**
    * Refreshes the access token using the refresh token.
    * If successful, updates and persists the new tokens.
+   * Concurrent callers (e.g. several in-flight requests hitting an access-token
+   * error at once) share a single underlying refresh instead of racing each
+   * other with the same refresh token.
    * @throws {Error} - Throws an error if the refresh token request fails or if the response is invalid.
    */
-  async refreshToken() {
+  refreshToken() {
+    if (!this._refreshTokenPromise) {
+      this._refreshTokenPromise = this._doRefreshToken().finally(() => {
+        this._refreshTokenPromise = null;
+      });
+    }
+    return this._refreshTokenPromise;
+  }
+
+  async _doRefreshToken() {
     const data = {
       ...this.getRequestData(),
       refresh_token: this.refresh_token,
@@ -578,12 +740,11 @@ module.exports = class WyzeAPI {
           await this._updateTokens(result.data.data);
           return; // Exit if successful.
         } else {
-          throw new Error(
-            `Failed to refresh access token - ${JSON.stringify(result)}`
-          );
+          throw new Error(`Failed to refresh access token - ${describeResult(result)}`);
         }
       } catch (error) {
-        attempt += 1;
+        // A refusal is final: sending the same refresh token again would be refused again.
+        attempt = error.refreshRefused ? maxRetries : attempt + 1;
         if (attempt < maxRetries) {
           this.log.info(`Retrying token refresh, attempt ${attempt}...`);
           // Wait before retrying
@@ -605,7 +766,7 @@ module.exports = class WyzeAPI {
             return;
           }
           this.log.error(`Error during token refresh: ${error.message}`);
-          throw new Error(`Token refresh failed: ${error.message}`);
+          throw new Error(`Token refresh failed: ${error.message}`, { cause: error });
         }
       }
     }
@@ -627,9 +788,10 @@ module.exports = class WyzeAPI {
       // Persist the updated tokens to storage.
       await this._persistTokens();
     } catch (error) {
-      // Handle errors during token persistence.
-      this.log.error(`Error updating tokens: ${error.message}`);
-      throw new Error(`Failed to update tokens: ${error.message}`);
+      // The new tokens are already in memory and good for this run. A disk that cannot be written (read-only, full) must
+      // not count as a failed login or refresh: that would send the consumed refresh token again, then log in afresh,
+      // which a one-time 2FA code cannot do twice.
+      this.log.error(`Could not save the login to disk (${error.message}); it works until this program restarts.`);
     }
   }
 
@@ -665,8 +827,9 @@ module.exports = class WyzeAPI {
         // Ensure the persist directory exists. HOOBS doesn't pre-create
         // its own /var/lib/hoobs/.../persist dir, so the first write
         // here was throwing ENOENT and the plugin never recovered.
-        await fs.mkdir(path.dirname(tokenPath), { recursive: true });
-        await fs.writeFile(tokenPath, JSON.stringify(data)); // Write tokens to the file.
+        await fs.mkdir(path.dirname(tokenPath), { recursive: true, mode: 0o700 }); // a folder made here is owner-only too
+        await fs.writeFile(tokenPath, JSON.stringify(data), { mode: 0o600 }); // Tokens are credentials: owner-only.
+        await fs.chmod(tokenPath, 0o600); // `mode` only applies to a newly created file; fix one saved by an older version.
         return; // Exit if successful.
       } catch (error) {
         attempt += 1;
@@ -683,6 +846,44 @@ module.exports = class WyzeAPI {
   }
 
   /**
+   * True for failures that say nothing about token validity: no HTTP response
+   * (DNS/connect/reset/timeout) or a 5xx from Wyze. Walks `cause` so wrapped
+   * errors are classified by the original failure.
+   */
+  _isTransientError(err) {
+    const TRANSIENT_CODES = new Set([
+      "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ECONNABORTED",
+      "ENOTFOUND", "EAI_AGAIN", "EPIPE", "EHOSTUNREACH", "ENETUNREACH",
+    ]);
+    for (let e = err, depth = 0; e && depth < 5; e = e.cause, depth += 1) {
+      if (e.code && TRANSIENT_CODES.has(e.code)) return true;
+      const status = e.response?.status;
+      if (status >= 500) return true;
+      if (e.isAxiosError && !e.response) return true;
+    }
+    return false;
+  }
+
+  /**
+  * Clears the in-memory tokens and deletes the persisted token file.
+  * Called once a refresh token is proven dead, so the next maybeLogin()
+  * finds nothing to reload and attempts a fresh login instead.
+  */
+  async _clearPersistedTokens() {
+    this.access_token = "";
+    this.refresh_token = "";
+
+    const tokenPath = this._tokenPersistPath();
+    try {
+      await fs.unlink(tokenPath);
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        this.log.error(`Error deleting persisted tokens: ${error.message}`);
+      }
+    }
+  }
+
+  /**
   * Loads persisted tokens from storage and updates the current tokens.
   * Logs a message if no tokens are found.
   * @throws {Error} - Throws an error if file reading or data parsing fails.
@@ -693,6 +894,8 @@ module.exports = class WyzeAPI {
     try {
       const data = await fs.readFile(tokenPath); // Read the token file.
       const parsedData = JSON.parse(data); // Parse the token data.
+      // A file saved by an older version may be readable by other users.
+      await fs.chmod(tokenPath, 0o600).catch(() => {});
 
       // Validate the token data structure.
       if (parsedData.access_token && parsedData.refresh_token) {
@@ -886,8 +1089,8 @@ module.exports = class WyzeAPI {
     );
   }
 
-  async setIotProp(deviceMac, product_model, propKey, value) {
-    const payload = payloadFactory.oliveCreatePostPayload(deviceMac, product_model, propKey, value);
+  async setIotProp(deviceMac, deviceModel, propKey, value) {
+    const payload = payloadFactory.oliveCreatePostPayload(deviceMac, deviceModel, propKey, value);
     return this._oliveSignedPost(
       `${constants.siriusBaseUrl}/plugin/sirius/set_iot_prop_by_topic`,
       payload,
@@ -939,10 +1142,51 @@ module.exports = class WyzeAPI {
 
     const response = await axios.post(url, payloadStr, {
       headers: { "Content-Type": "application/json" },
+      timeout: 10_000, // a bulb that never answers must not hang the caller
     });
 
           this.log.debug(`localBulbCommand response from ${deviceMac}: ${JSON.stringify(response.data)}`);
     return response.data;
+  }
+
+  // ---- Camera night vision, over the local network (the Wyze cloud does not expose it) ----
+  // The camera is asked directly (see src/tutk/client.js), so this only works from the same network as the camera,
+  // for a camera whose device list entry has the dtls flag, an IP and its keys. One conversation per camera at a
+  // time: the camera serves a few sessions, and a second at once only fails.
+
+  async _localCamera(mac) {
+    const tutk = require("./tutk/client");
+    const device = (await this.getDeviceList()).find((d) => d.mac === mac);
+    if (!device) throw new Error("no such camera on this account");
+    const why = tutk.cameraLocalSkipReason(device);
+    if (why) throw new Error(`night vision cannot be reached: ${why}`);
+    return { tutk, target: { host: device.device_params.ip, uid: device.device_params.p2p_id, enr: device.enr, mac: device.mac } };
+  }
+
+  _oneAtATime(mac, job) {
+    this._nightVisionBusy = this._nightVisionBusy || new Map();
+    const run = (this._nightVisionBusy.get(mac) || Promise.resolve()).then(job);
+    const tail = run.catch(() => {});
+    this._nightVisionBusy.set(mac, tail);
+    tail.then(() => { if (this._nightVisionBusy.get(mac) === tail) this._nightVisionBusy.delete(mac); });
+    return run;
+  }
+
+  /** The camera's night vision: "on", "off" or "auto". */
+  async getCameraNightVision(mac) {
+    return this._oneAtATime(mac, async () => {
+      const { tutk, target } = await this._localCamera(mac);
+      return tutk.readNightVision(target);
+    });
+  }
+
+  /** Sets night vision to "on", "off" or "auto" and reads it back: { before, after, matches }. */
+  async setCameraNightVision(mac, value) {
+    if (!["on", "off", "auto"].includes(String(value).toLowerCase())) throw new Error("night vision must be on, off or auto");
+    return this._oneAtATime(mac, async () => {
+      const { tutk, target } = await this._localCamera(mac);
+      return tutk.setNightVision({ ...target, value: String(value).toLowerCase() });
+    });
   }
 
   async getObjectListSafe() {
@@ -995,6 +1239,45 @@ module.exports = class WyzeAPI {
 
   async getDevicePID(deviceMac, deviceModel) {
     return await this.getPropertyList(deviceMac, deviceModel);
+  }
+
+  /**
+   * Read properties for several devices in one call. Wraps
+   * `app/v2/device_list/get_property_list`. The endpoint rejects an empty
+   * `target_pid_list`, so `pids` is required. Rows come back in request
+   * order with no usable MAC, so they are matched to `devices` by position.
+   * Throws on a non-SUCCESS code or a row-count mismatch; callers should
+   * fall back to `getDevicePID` per device.
+   * @param {Array<{mac: string}>} devices
+   * @param {string[]} pids
+   * @returns {Promise<Map<string, Array<{pid: string, value: string, ts: number}>>>}
+   */
+  async getPropertyListForDevices(devices, pids) {
+    if (!Array.isArray(devices) || devices.length === 0) {
+      throw new Error("getPropertyListForDevices: devices must be a non-empty array");
+    }
+    if (!Array.isArray(pids) || pids.length === 0) {
+      throw new Error("getPropertyListForDevices: pids must be a non-empty array");
+    }
+
+    const result = await this.request("app/v2/device_list/get_property_list", {
+      device_list: devices.map((d) => d.mac),
+      target_pid_list: pids,
+    });
+
+    // request() returns the HTTP response; Wyze's envelope is result.data.
+    const rows = (result.data && result.data.data && result.data.data.device_list) || [];
+    if (rows.length !== devices.length) {
+      throw new Error(
+        `getPropertyListForDevices: expected ${devices.length} rows, got ${rows.length}`
+      );
+    }
+
+    const byMac = new Map();
+    devices.forEach((d, i) => {
+      byMac.set(d.mac, rows[i].device_property_list || []);
+    });
+    return byMac;
   }
 
   /**
@@ -1169,3 +1452,12 @@ module.exports.IrrigationSoilType = types.IrrigationSoilType;
 module.exports.propertyIds = types.propertyIds;
 module.exports.WyzeAccessoryModels = types.WyzeAccessoryModels;
 module.exports.DeviceModels = types.DeviceModels;
+
+// The browser test page for cameras. Loaded on first use so importing the library stays light.
+for (const name of ["createCameraTestServer", "validateWebPort"]) {
+  Object.defineProperty(module.exports, name, {
+    enumerable: true,
+    configurable: true,
+    get: () => require("./web/cameraTestServer")[name],
+  });
+}

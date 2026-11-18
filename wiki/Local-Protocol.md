@@ -32,9 +32,9 @@ Wyze uses two different P2P stacks depending on the camera family:
 
 | Phase | What | Status |
 |---|---|---|
-| **0**  | Pure-JS protocol layer (`src/tutk/lib/` — codec, header, all K-class messages 10000–12060, xxtea, auth). Byte-exact against the docker-wyze-bridge Python reference. | ✅ done |
-| **1**  | `koffi` loader for `libIOTCAPIs_ALL.so` (`src/tutk/loader.js`) + Promise-based session/auth/IOCtrl mux (`src/tutk/session.js`). Uses koffi's `.async()` worker-pool variant for blocking SDK calls so timeouts actually fire. | ✅ done |
-| **1.5**| Self-test harness without the `.so` (stub SDK) + Docker smoke test that loads the real `.so` (`tests/docker/`) + real-camera smoke (`tests/docker/connect-real-camera.js`). | ✅ done |
+| **0**  | Pure-JS protocol layer (`future/tutk/lib/` — codec, header, all K-class messages 10000–12060, xxtea, auth). Byte-exact against the docker-wyze-bridge Python reference. | ✅ done |
+| **1**  | `koffi` loader for `libIOTCAPIs_ALL.so` (`future/tutk/loader.js`) + Promise-based session/auth/IOCtrl mux (`future/tutk/session.js`). Uses koffi's `.async()` worker-pool variant for blocking SDK calls so timeouts actually fire. | ✅ done |
+| **1.5**| Self-test harness without the `.so` (stub SDK) + Docker smoke test that loads the real `.so` (`future/tutk/docker/`) + real-camera smoke (`future/tutk/docker/connect-real-camera.js`). | ✅ done |
 | **2**  | Worker-thread receive pump — move the 50 Hz `avRecvIOCtrl` poll off the main event loop so video streaming is viable without dropping frames. | ⏳ planned |
 | **2.5**| Wire Tutk control into the homebridge bridge: route camera commands locally when Tutk is available, fall back to cloud HTTP otherwise. Opt-in via config. | ⏳ planned |
 | **3**  | A/V transport — `avRecvFrameData2` → H.264 NALUs into a stream that HomeKit (or any other consumer) can attach to. | ⏳ planned |
@@ -47,7 +47,7 @@ fallback.
 ### What's verified end-to-end as of Phase 1.5
 
 - 188/188 unit tests pass on macOS arm64 + Linux x64
-- Docker loader smoke (`tests/docker/run-tutk-smoke.sh`) — 17/17 checks
+- Docker loader smoke (`future/tutk/docker/run-tutk-smoke.sh`) — 17/17 checks
   pass on both arm64 and x64
 - Real-camera smoke against a Wyze V3 on the LAN — Wyze cloud login,
   device list, `.so` load, IOTC session attempt all clean; UDP P2P
@@ -60,7 +60,7 @@ fallback.
 
 | Phase | What | Status |
 |---|---|---|
-| **0** | Pure-JS protocol layer (`src/gutes/lib/` — RC5, frame parser, session crypto, KEEPALIVE builders, pcap reader). Byte-exact against the cryze Python reference. | ✅ done |
+| **0** | Pure-JS protocol layer (`future/gutes/lib/` — RC5, frame parser, session crypto, KEEPALIVE builders, pcap reader). Byte-exact against the cryze Python reference. | ✅ done |
 | **1** | `libiotp2pav.so` loading via `koffi` — blocked on writing a Bionic-to-glibc shim. The `.so` is yanked out of the Wyze APK and depends on Android's libc layout (`__system_property_get`, `__strchr_chk`, Bionic pthread layout, etc.). | ❌ not started |
 | **2** | A/V transport (MTP_DATA reassembly into H.264 NALUs) — blocked on Phase 1. | ❌ not started |
 
@@ -83,7 +83,7 @@ npx wyze-api-fetch-wyze-sdk --type gutes --xapk /path/to/wyze.xapk
 ```
 
 Files land in `~/.homebridge/wyze-sdk/` by default. See
-[`scripts/README.md`](https://github.com/jfarmer08/wyze-api/blob/main/scripts/README.md)
+[`scripts/README.md`](https://github.com/identd113/wyze-api/blob/2.x/scripts/README.md)
 in the repo for full options.
 
 ## Deep-dive READMEs
@@ -91,11 +91,11 @@ in the repo for full options.
 These live in the repo (not the wiki) because they're tightly coupled
 to the source layout:
 
-- **`src/tutk/README.md`** — loader + session details, lifecycle, thread model, error taxonomy
-- **`src/gutes/README.md`** — protocol layer + Phase 1 wall (Bionic shim)
-- **`example/tutk-spike/README.md`** — Tutk Phase 0 runnable demo + fixture tests
-- **`example/gutes-spike/README.md`** — GUTES Phase 0 runnable demo + pcap reader
-- **`tests/docker/README.md`** — Docker smoke harness, including the Docker Desktop on macOS UDP NAT caveat
+- **`future/tutk/README.md`** — loader + session details, lifecycle, thread model, error taxonomy
+- **`future/gutes/README.md`** — protocol layer + Phase 1 wall (Bionic shim)
+- **`future/tutk/demo/README.md`** — Tutk Phase 0 runnable demo + fixture tests
+- **`future/gutes/demo/README.md`** — GUTES Phase 0 runnable demo + pcap reader
+- **`future/tutk/docker/README.md`** — Docker smoke harness, including the Docker Desktop on macOS UDP NAT caveat
 
 ## How this fits the bigger picture
 
@@ -110,8 +110,8 @@ to the source layout:
                 │  cloud HTTP when it isn't:
                 ▼
   ┌──────────────────────────┐
-  │  src/tutk/session.js     │  Phase 1 (DONE) — runs the IOTC session
-  │  src/tutk/loader.js      │  Phase 1 (DONE) — koffi → libIOTCAPIs_ALL.so
+  │  future/tutk/session.js  │  Phase 1 (DONE) — runs the IOTC session
+  │  future/tutk/loader.js   │  Phase 1 (DONE) — koffi → libIOTCAPIs_ALL.so
   └──────────────────────────┘
                 │
                 ▼
@@ -121,5 +121,5 @@ to the source layout:
 ```
 
 For the Doorbell Pro family the equivalent diagram would route through
-`src/gutes/` instead — but Phase 1 there is gated on the Bionic shim
+`future/gutes/` instead — but Phase 1 there is gated on the Bionic shim
 and is not yet started.
